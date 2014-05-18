@@ -35,13 +35,14 @@ const int DS1307_I2C_ADDRESS = 0x68;
 const unsigned int EEPROM_SENSOR_START = 0;
 const unsigned int EEPROM_SENSOR_SIZE = 10;
 const unsigned int EEPROM_ZONE_START = 100;
-const unsigned int EEPROM_ZONE_SIZE = 2;
+const unsigned int EEPROM_ZONE_SIZE = 20;
 const unsigned int EEPROM_EVENT_START = 200;
 const unsigned int EEPROM_EVENT_SIZE = 10;
 const unsigned int TIMEOUT_MENU = 30000; //ms to wait before returning to clock display
 const unsigned int TIMEOUT_EDIT = 10000; //ms to wait before returning to clock display
 const char* DOW[] = {"","Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
+const unsigned int PIN_BUTTON_DOWN = A1;
 const unsigned int PIN_BUTTON_UP = A3;
 const unsigned int PIN_BUTTON_OK = A2;
 const unsigned int PIN_LCDD7 = 2;
@@ -56,11 +57,14 @@ const unsigned int PIN_PUMP = 8;
 const unsigned int PIN_BOILER = 9;
 
 unsigned int g_nSensorQuant;
+unsigned int g_nWaterLowTemp = 80;
+unsigned int g_nWaterHighTemp = 600;
 byte g_nEventQuant;
 OneWire ds(PIN_ONEWIRE);
 byte g_bufferInput[MAX_SERIAL];
 byte g_nCursorInput;
 byte g_nSelectedZone = 0xFF;
+bool g_bButtonDown = true;
 bool g_bButtonUp = true;
 bool g_bButtonOk = true;
 bool g_bEdit = false;
@@ -92,6 +96,7 @@ struct zone
     byte nHyst; //Hysteresis value (C/10)
     bool bOn; //True if calling for heat
     bool bSpace; //True if space heating zone (room, not water cylinder, requires pump)
+    char sName[10]; //Name of zone
 };
 
 timestamp g_tsNow; //Current time
@@ -112,6 +117,7 @@ void setup()
     pinMode(PIN_BOILER, OUTPUT);
     pinMode(PIN_PUMP, OUTPUT);
     pinMode(PIN_BUTTON_OK, INPUT_PULLUP);
+    pinMode(PIN_BUTTON_DOWN, INPUT_PULLUP);
     pinMode(PIN_BUTTON_UP, INPUT_PULLUP);
     Serial.begin(9600);
     Serial.println("Starting...");
@@ -166,7 +172,16 @@ void loop()
         {
             g_bButtonUp = bState;
             timerDebounce.start(30, true);
-            OnButtonUp(g_bButtonUp);
+            if(!g_bButtonUp)
+                OnButtonUpDown(true);
+        }
+        bState = digitalRead(PIN_BUTTON_DOWN);
+        if(g_bButtonDown != bState)
+        {
+            g_bButtonDown = bState;
+            timerDebounce.start(30, true);
+            if(!g_bButtonDown)
+                OnButtonUpDown(false);
         }
         bState = digitalRead(PIN_BUTTON_OK);
         if(g_bButtonOk != bState)
@@ -183,8 +198,7 @@ void loop()
 }
 
 /** Reads configuration from EEPROM
-    Slot 0 = Number of sensors
-    Slots 10-99 temperature sensor configuration (10 slots per sensor):
+    Slots 0-99 temperature sensor configuration (10 slots per sensor):
       Offset  Use
       0-7     UID (Set first byte to zero to clear sensor configuration)
       8       Zone
@@ -194,10 +208,11 @@ void loop()
       1-2     Timestamp
       3       Zone
       4-5     Temperature value
-    Slots 1100 - 1119 zone configuration (2 slots per zone)
+    Slots 1100 - 1219 zone configuration (20 slots per zone)
       Offset  Use
       0       Hysteresis (C*10 below setpoint to turn off)
       1       Space (True if space heating. False if water heating. Not sure if this is used! Maybe for toggling heat / water?)
+      2       Name (10 chars)
 */
 void ReadConfig()
 {
@@ -233,6 +248,8 @@ void ReadConfig()
     {
         g_zones[nZone].nHyst = EEPROM.read(nZone * EEPROM_ZONE_SIZE + EEPROM_ZONE_START);
         g_zones[nZone].bSpace = (EEPROM.read(nZone * EEPROM_ZONE_SIZE + EEPROM_ZONE_START + 1) == 1);
+        for(unsigned int i = 0; i < 10; ++i)
+            g_zones[nZone].sName[i] = EEPROM.read(nZone * EEPROM_ZONE_SIZE + EEPROM_ZONE_START + 2 + i);
     }
 }
 
@@ -378,7 +395,7 @@ void ParseSerial()
         break;
     case('Z'):
         //Zone
-        //Z z aa b - Configure zone z=zone, a=hysteresis (C/10), b=1 for space heating
+        //Z z aa b nnnnnnnnn - Configure zone z=zone, a=hysteresis (C/10), b=1 for space heating, n=name
         if(g_nCursorInput >= 8)
         {
             byte nZone = (g_bufferInput[2] - 48);
@@ -387,6 +404,13 @@ void ParseSerial()
             g_zones[nZone].nHyst = (g_bufferInput[4] - 48) * 10;
             g_zones[nZone].nHyst += (g_bufferInput[5] - 48);
             g_zones[nZone].bSpace = (g_bufferInput[7] != 48);
+            for(unsigned int i = 0; i < 10; i++)
+            {
+                if(i + 9 < g_nCursorInput)
+                    g_zones[nZone].sName[i] = g_bufferInput[9 + i];
+                else
+                    g_zones[nZone].sName[i] = ' ';
+            }
             SaveZone(nZone);
         }
         else
@@ -400,7 +424,10 @@ void ParseSerial()
                 Serial.print("C Hyst=");
                 Serial.print(float(g_zones[nZone].nHyst) / 10);
                 Serial.print(g_zones[nZone].bSpace?" Space ":" Water ");
-                Serial.println(g_zones[nZone].bOn?" On ":" Off ");
+                Serial.print(g_zones[nZone].bOn?" On ":" Off ");
+                for(unsigned int i = 0; i < 10; i++)
+                    Serial.print(g_zones[nZone].sName[i]);
+                Serial.println();
             }
         }
         break;
@@ -455,6 +482,20 @@ void ParseSerial()
             g_tsNextEvent.nTime = 0;
             for(unsigned int i = 0; i < MAX_EVENTS; i++)
                 EEPROM.write(i * EEPROM_EVENT_SIZE + EEPROM_EVENT_START, 0x00);
+        }
+        else if(g_bufferInput[1] == 'Z')
+        {
+            //Clear zones
+            Serial.println("Clear all zones");
+            for(unsigned int nZone = 0; nZone < 10; nZone++)
+            {
+                g_zones[nZone].nHyst = 0;
+                g_zones[nZone].bSpace = true;
+                g_zones[nZone].nSetpoint = 0;
+                for(unsigned int i = 0; i < 10; ++i)
+                    g_zones[nZone].sName[i] = ' ';
+                SaveZone(nZone);
+            }
         }
         break;
     case 's':
@@ -521,6 +562,8 @@ void SaveZone(unsigned int nZone)
 {
     EEPROM.write(nZone * EEPROM_ZONE_SIZE + EEPROM_ZONE_START, g_zones[nZone].nHyst);
     EEPROM.write(nZone * EEPROM_ZONE_SIZE + EEPROM_ZONE_START + 1, g_zones[nZone].bSpace?1:0);
+    for(unsigned int i = 0; i < 10; ++i)
+        EEPROM.write(nZone * EEPROM_ZONE_SIZE + EEPROM_ZONE_START + 2 + i, g_zones[nZone].sName[i]);
 }
 
 /** @brief  Saves a sensor configuration to EEPROM
@@ -864,27 +907,73 @@ byte CharToHex(char nChar)
     return nValue;
 }
 
-void OnButtonUp(bool bState)
+void OnButtonUpDown(bool bUp)
 {
-    if(bState)
-        return;
     if(g_bEdit)
     {
-        ToggleEdit();
-        return;
+        if(g_zones[g_nSelectedZone].bSpace)
+        {
+            if(bUp)
+            {
+                if(g_zones[g_nSelectedZone].nSetpoint < 100)
+                    g_zones[g_nSelectedZone].nSetpoint = g_zones[g_nSelectedZone].nSetpoint + 1;
+            }
+            else
+                if(g_zones[g_nSelectedZone].nSetpoint > 0)
+                    g_zones[g_nSelectedZone].nSetpoint = g_zones[g_nSelectedZone].nSetpoint - 1;
+        }
+        else
+        {
+            if(bUp)
+                g_zones[g_nSelectedZone].nSetpoint = g_nWaterHighTemp;
+            else
+                g_zones[g_nSelectedZone].nSetpoint = g_nWaterLowTemp;
+        }
     }
-    ++g_nSelectedZone;
-    if(g_nSelectedZone > 9)
+    else
     {
-        g_nSelectedZone = 0xFF;
-        getTime(true);
-    return;
+        if(bUp)
+            ++g_nSelectedZone;
+        else
+        {
+            if(g_nSelectedZone == 0xFF)
+                g_nSelectedZone = 10;
+            --g_nSelectedZone;
+        }
+        if(g_nSelectedZone > 9)
+        {
+            g_nSelectedZone = 0xFF;
+            getTime(true);
+            return;
+        }
+        timerDisplayTimeout.start(TIMEOUT_MENU, true);
     }
-    timerDisplayTimeout.start(TIMEOUT_MENU, true);
     g_lcd.clear();
-    g_lcd.print("Zone ");
-    g_lcd.print(g_nSelectedZone);
-    g_lcd.print(": ");
+    for(unsigned int i = 0; i < 10; ++i)
+        g_lcd.print(char(g_zones[g_nSelectedZone].sName[i]));
+    g_lcd.print(" ");
+    int nValue = 999;
+
+    for(unsigned int i = 0; i < g_nSensorQuant; ++i)
+    {
+        if((g_sensors[i].nZone == g_nSelectedZone) && (g_sensors[i].nValue < nValue))
+            nValue = g_sensors[i].nValue;
+    }
+
+    if(nValue == 999)
+        g_lcd.print("??.?C");
+    else
+    {
+        unsigned int nUnits = nValue / 10;
+        if(nUnits < 10)
+            g_lcd.print(" ");
+        g_lcd.print(nUnits);
+        g_lcd.print(".");
+        g_lcd.print(nValue - nUnits * 10);
+        g_lcd.print("C");
+    }
+    g_lcd.setCursor(0,1);
+    g_lcd.print("Setpoint: ");
     unsigned int nUnits = g_zones[g_nSelectedZone].nSetpoint / 10;
     if(nUnits < 10)
         g_lcd.print(" ");
@@ -892,7 +981,7 @@ void OnButtonUp(bool bState)
     g_lcd.print(".");
     g_lcd.print(g_zones[g_nSelectedZone].nSetpoint - nUnits * 10);
     g_lcd.print("C");
-    g_lcd.setCursor(11, 0);
+    g_lcd.setCursor(13, 1);
 }
 
 void OnButtonOk(bool bState)

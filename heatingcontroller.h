@@ -17,6 +17,6 @@ void ProcessEvents();
 void AddEvent(byte nZone, byte nDays, unsigned int nTime, int nSetpoint, bool bSave = true);
 void DeleteEvent(byte nEvent);
 byte CharToHex(char nChar);
-void OnButtonUp(bool bState);
 void OnButtonOk(bool bState);
+void OnButtonUpDown(bool bUp);
 void ToggleEdit();
