@@ -20,11 +20,12 @@
 *
 */
 
-#define _DEBUG_
-
+#include "Arduino.h"
+#include "heatingcontroller.h"
 #include <Wire.h>
 #include <OneWire.h>
 #include <EEPROM.h>
+#include <LiquidCrystal.h>
 #include <ribanTimer.h>
 
 const unsigned int MAX_SENSORS = 10;
@@ -37,20 +38,36 @@ const unsigned int EEPROM_ZONE_START = 100;
 const unsigned int EEPROM_ZONE_SIZE = 2;
 const unsigned int EEPROM_EVENT_START = 200;
 const unsigned int EEPROM_EVENT_SIZE = 10;
+const unsigned int TIMEOUT_MENU = 30000; //ms to wait before returning to clock display
+const unsigned int TIMEOUT_EDIT = 10000; //ms to wait before returning to clock display
+const char* DOW[] = {"","Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
-int g_nPump = 8;
-int g_nBoiler = 9;
-int g_nOneWire = 7;
-int g_nButton = 2;
+const unsigned int PIN_BUTTON_UP = A3;
+const unsigned int PIN_BUTTON_OK = A2;
+const unsigned int PIN_LCDD7 = 2;
+const unsigned int PIN_LCDD6 = 3;
+const unsigned int PIN_LCDD5 = 4;
+const unsigned int PIN_LCDD4 = 5;
+const unsigned int PIN_LCDRS = 6;
+const unsigned int PIN_LCDE = 10;
+
+const unsigned int PIN_ONEWIRE = 7;
+const unsigned int PIN_PUMP = 8;
+const unsigned int PIN_BOILER = 9;
+
 unsigned int g_nSensorQuant;
-unsigned int g_nEventQuant;
-OneWire ds(g_nOneWire);
+byte g_nEventQuant;
+OneWire ds(PIN_ONEWIRE);
 byte g_bufferInput[MAX_SERIAL];
 byte g_nCursorInput;
+byte g_nSelectedZone = 0xFF;
+bool g_bButtonUp = true;
+bool g_bButtonOk = true;
+bool g_bEdit = false;
 
 struct timestamp
 {
-    int nTime; //Minutes since 00:00
+    unsigned int nTime; //Minutes since 00:00
     byte nDay; //Bitwise flag of day. 1 = Sunday
 };
 
@@ -64,7 +81,7 @@ struct sensor
 struct event
 {
     unsigned int nTime; //Seconds since 00:00:00 Sunday
-    byte nDay; //Bitwise flag of which days of week. LSB = Sunday
+    byte nDays; //Bitwise flag of which days of week. LSB = Sunday
     byte nZone; //Zone this event relates to
     int nValue; //Temperature trigger value
 };
@@ -84,21 +101,26 @@ event g_events[MAX_EVENTS]; //reserve space for maximum number of events
 zone g_zones[10]; //Current temperature set-point for each zone
 
 Timer timerMinute; //Instantiate a timer to find minute boundaries
+Timer timerDebounce; //Instantiate a button debounce timer
+Timer timerDisplayTimeout; //Instantiate a timer for display (edit mode) timeout
+LiquidCrystal g_lcd(PIN_LCDRS, PIN_LCDE, PIN_LCDD4, PIN_LCDD5, PIN_LCDD6, PIN_LCDD7);
 
 /** @brief  Initialisation */
 void setup()
 {
     // initialize the digital pin as an output.
-    pinMode(g_nBoiler, OUTPUT);
-    pinMode(g_nPump, OUTPUT);
-    pinMode(g_nButton, INPUT_PULLUP);
-    Wire.begin();
+    pinMode(PIN_BOILER, OUTPUT);
+    pinMode(PIN_PUMP, OUTPUT);
+    pinMode(PIN_BUTTON_OK, INPUT_PULLUP);
+    pinMode(PIN_BUTTON_UP, INPUT_PULLUP);
     Serial.begin(9600);
+    Serial.println("Starting...");
+    Wire.begin();
     g_tsNextEvent.nDay = 0;
     g_tsNextEvent.nTime = 0;
     ReadConfig();
+    g_lcd.begin(16, 2); //initialise 16x2 LCD
     timerMinute.start(1000, true); //start minute timer to trigger on first second to start minute sync promptly
-    Serial.println("Initialised");
 }
 
 /** Main program loop */
@@ -126,8 +148,8 @@ void loop()
                 bPump |= g_zones[g_sensors[nSensor].nZone].bOn; //Contributes to call for heat (not zone 0 - water sensor)
         }
 
-        digitalWrite(g_nBoiler, bBoiler);
-        digitalWrite(g_nPump, bPump);
+        digitalWrite(PIN_BOILER, bBoiler);
+        digitalWrite(PIN_PUMP, bPump);
 
         unsigned int nSecs = 60 - getTime(false); //!@todo Is there a way to avoid calling getTime twice? First is to feed this minute's processing. Second is to estimate next minute boundary
         timerMinute.start((nSecs) * 1000, true); //Restart timer to hit next minute boundary
@@ -136,12 +158,27 @@ void loop()
     if(Serial.available())
         ReadSerial();
 
-    if(!digitalRead(g_nButton))
+
+    if(!timerDebounce.IsTriggered())
     {
-        //Button pressed
-        //!@todo Debounce button.
-        //!@todo Toggle current heating state
-        //!@todo Add another buttong for water?
+        bool bState = digitalRead(PIN_BUTTON_UP);
+        if(g_bButtonUp != bState)
+        {
+            g_bButtonUp = bState;
+            timerDebounce.start(30, true);
+            OnButtonUp(g_bButtonUp);
+        }
+        bState = digitalRead(PIN_BUTTON_OK);
+        if(g_bButtonOk != bState)
+        {
+            g_bButtonOk = bState;
+            timerDebounce.start(30, true);
+            OnButtonOk(g_bButtonOk);
+        }
+    }
+    if(timerDisplayTimeout.IsTriggered())
+    {
+        ToggleEdit();
     }
 }
 
@@ -182,12 +219,12 @@ void ReadConfig()
     //Get event configuration
     for(g_nEventQuant = 0; g_nEventQuant < MAX_EVENTS; g_nEventQuant++)
     {
-        g_events[g_nEventQuant].nDay = EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START);
-        if(0 == g_events[g_nEventQuant].nDay)
+        g_events[g_nEventQuant].nDays = EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START);
+        if(0 == g_events[g_nEventQuant].nDays)
             break; //Event not configured and expect all events to be stored contiguously
-        g_events[g_nEventQuant].nTime = EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 1) << 8 + EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 2);
+        g_events[g_nEventQuant].nTime = (EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 1) << 8) | EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 2);
         g_events[g_nEventQuant].nZone = EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 3);
-        g_events[g_nEventQuant].nValue = EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 4) << 8 + EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 5);
+        g_events[g_nEventQuant].nValue = (EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 4) << 8) | EEPROM.read(g_nEventQuant * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 5);
     }
     Serial.print(g_nEventQuant);
     Serial.println(" events configured");
@@ -217,7 +254,7 @@ bool ReadSerial()
         }
         ++g_nCursorInput;
     }
-    if(g_nCursorInput >= 20)
+    if(g_nCursorInput >= MAX_SERIAL)
         g_nCursorInput = 0; //buffer full so dispose of current message
     return false;
 }
@@ -233,22 +270,16 @@ void ParseSerial()
         //Sensor config
         if(g_nCursorInput >= 20)
         {
-            //Format S aaaaaaaaaaaaaaaa b
+            // Format S aaaaaaaaaaaaaaaa b
             // aaaaaaaaaaaaaaaa = sensor UID in hexadecimal
             // b = sensor zone
             byte data[8];
             for(unsigned int i = 0; i < 8; i++)
             {
-                byte nValue = g_bufferInput[2 + i * 2] - 48;
-                if(nValue > 9)
-                    nValue -= 7;
-                byte nData = nValue * 16;
-                nValue = g_bufferInput[3 + i * 2] - 48;
-                if(nValue > 9)
-                    nValue -= 7;
-                data[i] = nData + nValue;
+                data[i] = (CharToHex(g_bufferInput[2 + i * 2]) << 8) + CharToHex(g_bufferInput[3 + i * 2]);
             }
             AddSensor(data, *(g_bufferInput + 19) - 48);
+            return;
         }
         else
         {
@@ -277,32 +308,35 @@ void ParseSerial()
         //Event
         /*
             "E" List
-            "E aa" Show event aa NOT IMPLEMENTED
-            "E aa 0" Delete event aa NOT IMPLEMENTED
-            "E aa b hh:mm z +vvv" Add / modify event aa for day b (bitwise flag), time hh:mm, zone z, value +/-vvv
-            Event index (aa) is 0 - 99
+            "E- ee" Delete event ee
+            "E+ dd hh:mm z +vvv" Add event ee for days dd (bitwise flag in hex), time hh:mm, zone z, value +/-vvv
+            Event index (ee) is 0 - 99
             Zone (z) is 0 - 9
         */
-        if(g_nCursorInput >= 6) //!@todo check size
+        if(g_nCursorInput >= 5)
         {
-            byte nEvent = (g_bufferInput[2] - 48) * 10 + g_bufferInput[3] - 48;
-            if(nEvent > MAX_EVENTS)
-                return;
-            g_events[nEvent].nDay = g_bufferInput[5];
-            if(0 == g_events[nEvent].nDay)
+            if(g_bufferInput[1] == '-')
             {
+                //Delete event
+                byte nEvent = (g_bufferInput[3] - 48) * 10;
+                nEvent += g_bufferInput[4] - 48;
                 DeleteEvent(nEvent);
                 return;
             }
-            if(g_nCursorInput < 19)
+            if(g_bufferInput[1] != '+')
                 return;
-            g_events[nEvent].nTime = (g_bufferInput[7] - 48) * 600 + (g_bufferInput[8] - 48) * 60 + (g_bufferInput[10] - 48) * 10 + g_bufferInput[11] - 48;
-            g_events[nEvent].nZone = g_bufferInput[13] - 48;
-            int nValue = (g_bufferInput[16] - 48) * 100 + (g_bufferInput[17] - 48) * 10 + g_bufferInput[18] - 48;
-            if(g_bufferInput[15] == '-')
+            if(g_nCursorInput < 18)
+                return;
+            if(g_nEventQuant >= MAX_EVENTS)
+                return;
+            //Add event
+            byte nDays = (CharToHex(g_bufferInput[3]) << 4) + CharToHex(g_bufferInput[4]);
+            unsigned int nTime = (g_bufferInput[6] - 48) * 600 + (g_bufferInput[7] - 48) * 60 + (g_bufferInput[9] - 48) * 10 + g_bufferInput[10] - 48;
+            byte nZone = g_bufferInput[12] - 48;
+            int nValue = (g_bufferInput[15] - 48) * 100 + (g_bufferInput[16] - 48) * 10 + g_bufferInput[17] - 48;
+            if(g_bufferInput[14] == '-')
                 nValue = -nValue;
-            g_events[nEvent].nValue = nValue;
-            SaveEvent(nEvent);
+            AddEvent(nZone, nDays, nTime, nValue);
             ProcessEvents();
         }
         else
@@ -311,13 +345,29 @@ void ParseSerial()
             Serial.println(g_nEventQuant);
             for(unsigned int nEvent = 0; nEvent < g_nEventQuant; nEvent++)
             {
-                //!@todo print timestamp in human readable form
-                Serial.print(g_events[nEvent].nDay);
+                Serial.print(nEvent);
+                Serial.print(": ");
+                byte nHours = g_events[nEvent].nTime / 60;
+                byte nMinutes = g_events[nEvent].nTime - (nHours * 60);
+                Serial.print(nHours);
+                Serial.print(":");
+                if(nMinutes < 10)
+                    Serial.print("0");
+                Serial.print(nMinutes);
                 Serial.print(" ");
-                Serial.print(g_events[nEvent].nTime);
-                Serial.print("  ");
+                byte nFlag = 2;
+                for(byte nDow = 1; nDow < 8; nDow++)
+                {
+                    if(g_events[nEvent].nDays & nFlag)
+                    {
+                        Serial.print(DOW[nDow]);
+                        Serial.print(" ");
+                    }
+                    nFlag = nFlag << 1;
+                }
+                Serial.print("Zone=");
                 Serial.print(g_events[nEvent].nZone);
-                Serial.print("  ");
+                Serial.print(" Setpoint=");
                 Serial.println(float(g_events[nEvent].nValue)/10);
             }
             Serial.print("Next event at ");
@@ -328,6 +378,7 @@ void ParseSerial()
         break;
     case('Z'):
         //Zone
+        //Z z aa b - Configure zone z=zone, a=hysteresis (C/10), b=1 for space heating
         if(g_nCursorInput >= 8)
         {
             byte nZone = (g_bufferInput[2] - 48);
@@ -352,7 +403,6 @@ void ParseSerial()
                 Serial.println(g_zones[nZone].bOn?" On ":" Off ");
             }
         }
-        //Zz aa b - Configure zone z=zone, a=hysteresis (C/10), b=1 for space heating
         break;
     case 'T':
         //Time
@@ -404,7 +454,7 @@ void ParseSerial()
             g_nEventQuant = 0;
             g_tsNextEvent.nTime = 0;
             for(unsigned int i = 0; i < MAX_EVENTS; i++)
-                EEPROM.write(i * EEPROM_EVENT_SIZE + EEPROM_EVENT_START, 0xFF);
+                EEPROM.write(i * EEPROM_EVENT_SIZE + EEPROM_EVENT_START, 0x00);
         }
         break;
     case 's':
@@ -413,8 +463,10 @@ void ParseSerial()
         break;
     case 'd':
         //debug
-        for(unsigned int i = 0; i < 11; i++)
+        for(unsigned int i = 0; i <= 100; i++)
         {
+            Serial.print(i);
+            Serial.print("\t");
             for(unsigned int j = 0; j < 10; j++)
             {
                 byte nVal = EEPROM.read(i * EEPROM_SENSOR_SIZE + EEPROM_SENSOR_START + j);
@@ -426,21 +478,26 @@ void ParseSerial()
             Serial.println();
         }
         break;
+    case 10:
+    case 13:
+        //ignore extra line endings
+        break;
     default:
         //Show help
         //!@todo Remove serial help if memory becomes scarce
-        Serial.println(F("E - List Events"));
-        Serial.println(F("E aa b hh:mm z +vvv - Add / modify event a=event id b=DoW, hh:mm-time, z=zone, +/-v=temperature (x10)"));
-        Serial.println(F("S uuuuuuuuuuuuuuuuz - Add / modify sensor u=UID, z=zone"));
-        Serial.println(F("S - List Sensors"));
-        Serial.println(F("T hh:mm:ss a dd/mm/yy - Set time and date a=DoW, Sunday = 1"));
-        Serial.println(F("T - Show time"));
-        Serial.println(F("CE - Clear all events"));
-        Serial.println(F("CS - Clear all sensors"));
-        Serial.println(F("Z z aa b - Configure zone z=zone, a=hysteresis (C/10), b=1 for space heating"));
-        Serial.println(F("Z - List zones"));
-        Serial.println(F("s - Scan for sensors"));
-        Serial.println(F("d - Debug output"));
+        Serial.println(F("E\t\t\tList Events"));
+        Serial.println(F("E- ee\t\t\tDelete event ee"));
+        Serial.println(F("E+ dd hh:mm z +vvv\tAdd event dd=bitwise DoW (00 to delete event), hh:mm-time, z=zone, +/-v=temperature (x10)"));
+        Serial.println(F("S uuuuuuuuuuuuuuuu z\tAdd / modify sensor u=UID, z=zone"));
+        Serial.println(F("S\t\t\tList Sensors"));
+        Serial.println(F("T hh:mm:ss a dd/mm/yy\tSet time and date a=DoW, Sunday = 1"));
+        Serial.println(F("T\t\t\tShow time"));
+        Serial.println(F("CE\t\t\tClear all events"));
+        Serial.println(F("CS\t\t\tClear all sensors"));
+        Serial.println(F("Z z aa b\t\tConfigure zone z=zone, a=hysteresis (C/10), b=1 for space heating"));
+        Serial.println(F("Z\t\t\tList zones"));
+        Serial.println(F("s\t\t\tScan for sensors"));
+        Serial.println(F("d\t\t\tDebug output"));
     }
 }
 
@@ -449,11 +506,11 @@ void ParseSerial()
 */
 void SaveEvent(unsigned int nEvent)
 {
-    EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START, g_events[nEvent].nDay);
+    EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START, g_events[nEvent].nDays);
     EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 1, (g_events[nEvent].nTime & 0xFF00) >> 8);
     EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 2, g_events[nEvent].nTime & 0xFF);
     EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 3, g_events[nEvent].nZone);
-    EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 4, g_events[nEvent].nValue >> 8);
+    EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 4, (g_events[nEvent].nValue & 0xFF00) >> 8);
     EEPROM.write(nEvent * EEPROM_EVENT_SIZE + EEPROM_EVENT_START + 5, g_events[nEvent].nValue & 0xFF);
 }
 
@@ -520,6 +577,7 @@ void AddSensor(byte* pAddress, byte nZone)
         Serial.println("Updating existing sensor");
     g_sensors[nSensor].nZone = nZone;
     EEPROM.write(nSensor * 10 + 8, nZone);
+    GetTemperature(nSensor);
 }
 
 /** @brief  Scans sensor network
@@ -619,31 +677,57 @@ byte getTime(bool bShow)
     byte nYear       = bcdToDec(Wire.read());
     g_tsNow.nTime    = nMinute + nHour * 60;
 
-    if(bShow)
+    if(bShow && g_nSelectedZone == 0xFF)
     {
         //!@todo Reduce vebosity of date if memory becomes sparse
-        char  *Day[] = {"","Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-        char  *Mon[] = {"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+        g_lcd.clear();
         if (nHour < 10)
+        {
+            g_lcd.print("0");
             Serial.print("0");
+        }
+        g_lcd.print(nHour);
         Serial.print(nHour, DEC);
+        g_lcd.print(":");
         Serial.print(":");
         if (nMinute < 10)
+        {
+            g_lcd.print("0");
             Serial.print("0");
+        }
+        g_lcd.print(nMinute);
         Serial.print(nMinute, DEC);
         Serial.print(":");
         if (nSecond < 10)
+        {
             Serial.print("0");
+        }
         Serial.print(nSecond, DEC);
+        g_lcd.setCursor(0,1);
         Serial.print("  ");
-        Serial.print(Day[g_tsNow.nDay]);
-        Serial.print(", ");
-        Serial.print(nDay, DEC);
+        g_lcd.print(DOW[g_tsNow.nDay]);
+        Serial.print(DOW[g_tsNow.nDay]);
+        g_lcd.print(" ");
         Serial.print(" ");
-        Serial.print(Mon[nMonth]);
-        Serial.print(" 20");
-        if (nYear < 10)
+        g_lcd.print(nDay);
+        Serial.print(nDay, DEC);
+        g_lcd.print("/");
+        Serial.print("/");
+        if(nMonth < 10)
+        {
+            g_lcd.print("0");
             Serial.print("0");
+        }
+        g_lcd.print(nMonth);
+        Serial.print(nMonth, DEC);
+        g_lcd.print("/");
+        Serial.print("/");
+        if (nYear < 10)
+        {
+            g_lcd.print("0");
+            Serial.print("0");
+        }
+        g_lcd.print(nYear);
         Serial.println(nYear, DEC);
     }
     return nSecond;
@@ -712,14 +796,14 @@ void ProcessEvents()
 
     for(unsigned int nEvent = 0; nEvent < g_nEventQuant; nEvent++)
     {
-        if(g_events[nEvent].nTime == g_tsNow.nTime && g_events[nEvent].nDay & g_tsNow.nDay)
+        if(g_events[nEvent].nTime == g_tsNow.nTime && g_events[nEvent].nDays & g_tsNow.nDay)
         {
             //Set zone temperature set-point
             g_zones[g_events[nEvent].nZone].nSetpoint = g_events[nEvent].nValue;
         }
 
         //Find next scheduled event
-        if(g_events[nEvent].nDay & g_tsNow.nDay && g_events[nEvent].nTime > g_tsNow.nTime && g_events[nEvent].nTime < g_tsNextEvent.nTime)
+        if(g_events[nEvent].nDays & g_tsNow.nDay && g_events[nEvent].nTime > g_tsNow.nTime && g_events[nEvent].nTime < g_tsNextEvent.nTime)
         {
             g_tsNextEvent.nTime = g_events[nEvent].nTime;
             g_tsNextEvent.nDay = g_tsNow.nDay;
@@ -737,24 +821,111 @@ void ProcessEvents()
     Serial.print("Next event: ");
     Serial.print(g_tsNextEvent.nTime);
     Serial.print(" on ");
-    Serial.print(g_tsNextEvent.nDay);
+    Serial.println(g_tsNextEvent.nDay);
+}
+
+void AddEvent(byte nZone, byte nDays, unsigned int nTime, int nSetpoint, bool bSave)
+{
+    if(g_nEventQuant >= MAX_EVENTS)
+        return;
+    g_events[g_nEventQuant].nDays = nDays;
+    g_events[g_nEventQuant].nTime = nTime;
+    g_events[g_nEventQuant].nZone = nZone;
+    g_events[g_nEventQuant].nValue = nSetpoint;
+    if(bSave)
+        SaveEvent(g_nEventQuant);
+    g_nEventQuant++;
 }
 
 void DeleteEvent(byte nEvent)
 {
+    if(nEvent >= g_nEventQuant)
+        return;
     //Deleting event so shift all others
-    for(g_nEventQuant = nEvent; g_nEventQuant < MAX_EVENTS - 1; g_nEventQuant++)
+    byte nEventQuant;
+    for(nEventQuant = nEvent; nEventQuant < g_nEventQuant; nEventQuant++)
     {
-        g_events[g_nEventQuant].nDay = g_events[g_nEventQuant + 1].nDay;
-        if(0 == g_events[g_nEventQuant].nDay)
-            break;
-        g_events[g_nEventQuant].nTime = g_events[g_nEventQuant + 1].nTime;
-        g_events[g_nEventQuant].nZone = g_events[g_nEventQuant + 1].nZone;
-        g_events[g_nEventQuant].nValue = g_events[g_nEventQuant + 1].nValue;
+        g_events[nEventQuant].nDays = g_events[nEventQuant + 1].nDays;
+        g_events[nEventQuant].nTime = g_events[nEventQuant + 1].nTime;
+        g_events[nEventQuant].nZone = g_events[nEventQuant + 1].nZone;
+        g_events[nEventQuant].nValue = g_events[nEventQuant + 1].nValue;
+        SaveEvent(nEventQuant);
     }
-    Serial.print("Deleted event ");
-    Serial.print(nEvent);
-    Serial.print(". Quantity of events=");
-    Serial.println(g_nEventQuant);
+    --g_nEventQuant;
+}
+
+byte CharToHex(char nChar)
+{
+    byte nValue = nChar - 48;
+    if(nValue > 9)
+        nValue -= 7;
+    if(nValue > 0x0F)
+        nValue = 0;
+    return nValue;
+}
+
+void OnButtonUp(bool bState)
+{
+    if(bState)
+        return;
+    if(g_bEdit)
+    {
+        ToggleEdit();
+        return;
+    }
+    ++g_nSelectedZone;
+    if(g_nSelectedZone > 9)
+    {
+        g_nSelectedZone = 0xFF;
+        getTime(true);
     return;
+    }
+    timerDisplayTimeout.start(TIMEOUT_MENU, true);
+    g_lcd.clear();
+    g_lcd.print("Zone ");
+    g_lcd.print(g_nSelectedZone);
+    g_lcd.print(": ");
+    unsigned int nUnits = g_zones[g_nSelectedZone].nSetpoint / 10;
+    if(nUnits < 10)
+        g_lcd.print(" ");
+    g_lcd.print(nUnits);
+    g_lcd.print(".");
+    g_lcd.print(g_zones[g_nSelectedZone].nSetpoint - nUnits * 10);
+    g_lcd.print("C");
+    g_lcd.setCursor(11, 0);
+}
+
+void OnButtonOk(bool bState)
+{
+    if(bState)
+        return;
+    if(g_nSelectedZone == 0xFF)
+        return;
+    if(!g_bEdit)
+    {
+        g_bEdit = true;
+        g_lcd.blink();
+        timerDisplayTimeout.start(TIMEOUT_EDIT, true);
+    }
+    else
+    {
+        g_lcd.noBlink();
+        g_bEdit = false;
+    }
+}
+
+void ToggleEdit()
+{
+    if(g_bEdit)
+    {
+        g_bEdit = false;
+        g_lcd.noBlink();
+        timerDisplayTimeout.start(TIMEOUT_EDIT);
+    }
+    else
+    {
+        g_nSelectedZone = 0xFF;
+        getTime(true);
+        timerDisplayTimeout.start(TIMEOUT_MENU);
+    }
 }
